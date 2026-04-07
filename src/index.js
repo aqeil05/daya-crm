@@ -8,7 +8,9 @@
 //   GET  /setup-telegram — One-time: register Telegram webhook
 //   POST /retry          — Retry failed pipeline runs
 //   GET  /health         — Liveness check
-// Scheduled (cron):  Renew Graph subscriptions every 12 hours
+//   GET  /tenders/test   — Manually trigger a tender scan (dev/ops use)
+// Scheduled (cron 0 */12 * * *): Renew Graph subscriptions every 12 hours
+// Scheduled (cron 0 */6  * * *): Scan tender portals every 6 hours
 
 import { pipeline } from "./pipeline.js";
 import { registerSubscription, renewSubscriptions, INBOXES } from "./graph.js";
@@ -72,6 +74,22 @@ export default {
       return handleSetupTelegram(env);
     }
 
+    // ── Manual tender scan trigger (dev / ops) ────────────────────────────────
+    if (url.pathname === "/tenders/test" && request.method === "GET") {
+      return handleTendersTest(env);
+    }
+
+    // ── Fire a fake Telegram tender alert (notification format test) ──────────
+    if (url.pathname === "/tenders/notify-test" && request.method === "GET") {
+      return handleTendersNotifyTest(env);
+    }
+
+    // ── Tender scrape debugger: shows raw extracted text per portal ───────────
+    // Usage: GET /tenders/debug?portal=protenders
+    if (url.pathname === "/tenders/debug" && request.method === "GET") {
+      return handleTendersDebug(env, url);
+    }
+
     // ── Graph webhook notifications ───────────────────────────────────────────
     if (url.pathname === "/webhook" && request.method === "POST") {
       return handleWebhook(request, env, ctx);
@@ -82,8 +100,16 @@ export default {
 
   // ── Scheduled handler (cron) ─────────────────────────────────────────────────
   async scheduled(event, env, ctx) {
-    console.log("Cron: renewing Graph subscriptions");
-    ctx.waitUntil(renewSubscriptions(env));
+    if (event.cron === "0 */12 * * *") {
+      console.log("Cron: renewing Graph subscriptions");
+      ctx.waitUntil(renewSubscriptions(env));
+    }
+
+    if (event.cron === "0 */6 * * *") {
+      console.log("Cron: scanning tender portals");
+      const { runTenderScan } = await import("./tenders/index.js");
+      ctx.waitUntil(runTenderScan(env));
+    }
   },
 };
 
@@ -187,6 +213,92 @@ async function handleWebhook(request, env, ctx) {
   ctx.waitUntil(Promise.all(processAll).catch((err) => console.error("Unhandled pipeline error:", err)));
 
   return new Response("OK", { status: 200 });
+}
+
+// ── /tenders/notify-test ─────────────────────────────────────────────────────
+
+async function handleTendersNotifyTest(env) {
+  const { notifyTender } = await import("./tenders/notify.js");
+
+  const fakeTender = {
+    id: "111339452",
+    title: "Interior Fit-Out Works for Gift Shops at Student Affairs Building",
+    description: "Interior finishing and furnishing of retail gift shop spaces within the Student Affairs Building at Qatar University. Tender bond: QAR 35,000. Document cost: QAR 500.",
+    deadline: "2026-04-29",
+    issuer: "Qatar University",
+    url: "https://www.biddetail.com/latest-tenders/111339452$17f204cc-0d1b-4e38-93df-00cdaf61f9fe",
+    value: "",
+  };
+
+  try {
+    await notifyTender(env, "biddetail", fakeTender);
+    return new Response(JSON.stringify({ ok: true, tender: fakeTender }, null, 2), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    return new Response(JSON.stringify({ ok: false, error: err.message }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+}
+
+// ── /tenders/debug ───────────────────────────────────────────────────────────
+
+async function handleTendersDebug(env, url) {
+  const portalId = url.searchParams.get("portal");
+
+  const FETCHERS = {
+    monaqasat: () => import("./tenders/portals/monaqasat.js").then(m => m.fetchTenders()),
+    biddetail:  () => import("./tenders/portals/biddetail.js").then(m => m.fetchTenders()),
+  };
+
+  if (!portalId || !FETCHERS[portalId]) {
+    return new Response(
+      JSON.stringify({ error: `?portal= must be one of: ${Object.keys(FETCHERS).join(", ")}` }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  try {
+    const rawText = await FETCHERS[portalId]();
+    const { extractTenders } = await import("./tenders/extract.js");
+    const tenders = await extractTenders(env, portalId, rawText);
+    return new Response(
+      JSON.stringify({
+        portal: portalId,
+        rawTextLength: rawText.length,
+        rawTextPreview: rawText.slice(0, 800),
+        tendersExtracted: tenders.length,
+        tenders,
+      }, null, 2),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  } catch (err) {
+    return new Response(
+      JSON.stringify({ portal: portalId, error: err.message }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+}
+
+// ── /tenders/test ────────────────────────────────────────────────────────────
+
+async function handleTendersTest(env) {
+  const { runTenderScan } = await import("./tenders/index.js");
+  try {
+    const results = await runTenderScan(env);
+    return new Response(JSON.stringify(results, null, 2), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: err.message }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
 }
 
 // ── /setup ────────────────────────────────────────────────────────────────────
