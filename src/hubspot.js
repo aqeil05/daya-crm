@@ -8,6 +8,8 @@
 //   - Dropdown/multi-select fields must never be null — use "" or []
 //   - URL must be api.hubapi.com (without api. prefix returns HTML)
 
+import { notifyAdminEnum } from "./notify.js";
+
 const HS_BASE = "https://api.hubapi.com";
 
 function authHeaders(token) {
@@ -105,27 +107,152 @@ export async function searchCompany(env, companyName) {
   return null;
 }
 
+// ── Enum validation helpers ───────────────────────────────────────────────────
+
+// Fetch live picklist options for a company property.
+// Returns [{label, value}] — the source of truth from HubSpot.
+async function fetchPropertyOptions(token, propertyName) {
+  const data = await hsRequest(
+    "GET",
+    `${HS_BASE}/crm/v3/properties/companies/${encodeURIComponent(propertyName)}`,
+    token,
+  );
+  return (data?.options || []).filter(o => !o.hidden).map(o => ({ label: o.label, value: o.value }));
+}
+
+// Jaccard similarity on word tokens (no deps, runs in Workers).
+// Splits on whitespace, hyphens, ampersands, commas so that
+// "Flooring - Stone Marble & Tiles" and "Flooring - Stone, Marble & Tiles"
+// both tokenise to {flooring, stone, marble, tiles} → score 1.0.
+function stringSimilarity(a, b) {
+  const tokenise = s => new Set(s.toLowerCase().split(/[\s\-&,]+/).filter(Boolean));
+  const ta = tokenise(a);
+  const tb = tokenise(b);
+  const intersection = [...ta].filter(t => tb.has(t)).length;
+  const union = new Set([...ta, ...tb]).size;
+  return union === 0 ? 0 : intersection / union;
+}
+
+// Returns the closest option object if score >= threshold, else null.
+function findClosestOption(value, options, threshold = 0.6) {
+  let best = null;
+  let bestScore = 0;
+  for (const opt of options) {
+    const score = stringSimilarity(value, opt.label);
+    if (score > bestScore) { bestScore = score; best = opt; }
+  }
+  return bestScore >= threshold ? best : null;
+}
+
+// Adds a new option to a HubSpot company picklist property.
+// Fetches current options first so the PATCH is non-destructive.
+// Returns the new option's value string on success.
+async function addPropertyOption(token, propertyName, newLabel) {
+  const existing = await fetchPropertyOptions(token, propertyName);
+  const newOption = { label: newLabel, value: newLabel, displayOrder: -1, hidden: false };
+  await hsRequest("PATCH", `${HS_BASE}/crm/v3/properties/companies/${encodeURIComponent(propertyName)}`, token, {
+    options: [...existing.map(o => ({ ...o, displayOrder: o.displayOrder ?? -1, hidden: false })), newOption],
+  });
+  return newLabel;
+}
+
+// For each INVALID_OPTION error in validationResults, resolve the rejected value
+// by fuzzy-matching against live HubSpot options, auto-adding if needed, or
+// nullifying and alerting admin as a last resort.
+// Returns corrected { mainIndustry, subIndustries }.
+async function resolveInvalidEnumFields(env, { mainIndustry, subIndustries }, validationResults) {
+  const token = env.HUBSPOT_PRIVATE_APP_TOKEN;
+  let resolvedMain = mainIndustry;
+  let resolvedSubs = [...(subIndustries || [])];
+
+  for (const result of validationResults) {
+    if (result.error !== "INVALID_OPTION") continue;
+
+    const propName = result.name; // e.g. "sub_industry" or "main_industry"
+    // Extract the rejected value from the message: "{value} was not one of the allowed options..."
+    const rejectedValue = (result.message || "").replace(/ was not one of the allowed options.*$/i, "").trim();
+    if (!rejectedValue) continue;
+
+    let options;
+    try {
+      options = await fetchPropertyOptions(token, propName);
+    } catch {
+      // Can't fetch options — alert admin and blank the field
+      await notifyAdminEnum(env, { action: "needs_admin", propertyName: propName, rejectedValue }).catch(() => {});
+      if (propName === "main_industry") resolvedMain = "";
+      else resolvedSubs = resolvedSubs.filter(v => v !== rejectedValue);
+      continue;
+    }
+
+    const match = findClosestOption(rejectedValue, options);
+
+    if (match) {
+      // Close enough — substitute silently with a warning
+      await notifyAdminEnum(env, { action: "matched", propertyName: propName, rejectedValue, resolvedValue: match.value }).catch(() => {});
+      if (propName === "main_industry") resolvedMain = match.value;
+      else resolvedSubs = resolvedSubs.map(v => v === rejectedValue ? match.value : v);
+    } else {
+      // No match — try to create the new option
+      try {
+        await addPropertyOption(token, propName, rejectedValue);
+        await notifyAdminEnum(env, { action: "added", propertyName: propName, rejectedValue }).catch(() => {});
+        // Value stays as-is — it's now valid in HubSpot
+      } catch {
+        // Can't add — blank the field and alert admin to do it manually
+        await notifyAdminEnum(env, { action: "needs_admin", propertyName: propName, rejectedValue }).catch(() => {});
+        if (propName === "main_industry") resolvedMain = "";
+        else resolvedSubs = resolvedSubs.filter(v => v !== rejectedValue);
+      }
+    }
+  }
+
+  return { mainIndustry: resolvedMain, subIndustries: resolvedSubs };
+}
+
 // ── Create company ────────────────────────────────────────────────────────────
 // Returns company ID string
 
 export async function createCompany(env, { companyName, domain, mainIndustry, subIndustries, relationship }) {
   const token = env.HUBSPOT_PRIVATE_APP_TOKEN;
 
-  const res = await fetch(`${HS_BASE}/companies/v2/companies/`, {
+  const buildProps = (mi, si) => [
+    { name: "name", value: companyName || "" },
+    { name: "domain", value: domain || "" },
+    { name: "main_industry", value: mi || "" },
+    { name: "sub_industry", value: (si || []).join(";") },
+    { name: "relationship", value: relationship || "" },
+  ];
+
+  let res = await fetch(`${HS_BASE}/companies/v2/companies/`, {
     method: "POST",
     headers: authHeaders(token),
-    body: JSON.stringify({
-      properties: [
-        { name: "name", value: companyName || "" },
-        { name: "domain", value: domain || "" },
-        { name: "main_industry", value: mainIndustry || "" },
-        { name: "sub_industry", value: (subIndustries || []).join(";") },
-        { name: "relationship", value: relationship || "" },
-      ],
-    }),
+    body: JSON.stringify({ properties: buildProps(mainIndustry, subIndustries) }),
   });
 
-  if (!res.ok) {
+  // On INVALID_OPTION errors, resolve each bad value and retry once
+  if (res.status === 400) {
+    const text = await res.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { /* not JSON — fall through */ }
+
+    const hasInvalidOption = parsed?.validationResults?.some(r => r.error === "INVALID_OPTION");
+    if (hasInvalidOption) {
+      const { mainIndustry: mi, subIndustries: si } = await resolveInvalidEnumFields(
+        env, { mainIndustry, subIndustries }, parsed.validationResults,
+      );
+      res = await fetch(`${HS_BASE}/companies/v2/companies/`, {
+        method: "POST",
+        headers: authHeaders(token),
+        body: JSON.stringify({ properties: buildProps(mi, si) }),
+      });
+      if (!res.ok) {
+        const retryText = await res.text();
+        throw new Error(`createCompany failed: ${res.status} ${retryText}`);
+      }
+    } else {
+      throw new Error(`createCompany failed: 400 ${text}`);
+    }
+  } else if (!res.ok) {
     const text = await res.text();
     throw new Error(`createCompany failed: ${res.status} ${text}`);
   }
@@ -139,14 +266,46 @@ export async function createCompany(env, { companyName, domain, mainIndustry, su
 export async function updateCompany(env, companyId, { domain, mainIndustry, subIndustries, relationship }) {
   const token = env.HUBSPOT_PRIVATE_APP_TOKEN;
 
-  await hsRequest("PUT", `${HS_BASE}/companies/v2/companies/${companyId}`, token, {
-    properties: [
-      { name: "domain", value: domain || "" },
-      { name: "main_industry", value: mainIndustry || "" },
-      { name: "sub_industry", value: (subIndustries || []).join(";") },
-      { name: "relationship", value: relationship || "" },
-    ],
+  const buildProps = (mi, si) => [
+    { name: "domain", value: domain || "" },
+    { name: "main_industry", value: mi || "" },
+    { name: "sub_industry", value: (si || []).join(";") },
+    { name: "relationship", value: relationship || "" },
+  ];
+
+  const url = `${HS_BASE}/companies/v2/companies/${companyId}`;
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: authHeaders(token),
+    body: JSON.stringify({ properties: buildProps(mainIndustry, subIndustries) }),
   });
+
+  if (res.status === 400) {
+    const text = await res.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { /* not JSON */ }
+
+    const hasInvalidOption = parsed?.validationResults?.some(r => r.error === "INVALID_OPTION");
+    if (hasInvalidOption) {
+      const { mainIndustry: mi, subIndustries: si } = await resolveInvalidEnumFields(
+        env, { mainIndustry, subIndustries }, parsed.validationResults,
+      );
+      const retry = await fetch(url, {
+        method: "PUT",
+        headers: authHeaders(token),
+        body: JSON.stringify({ properties: buildProps(mi, si) }),
+      });
+      if (!retry.ok) {
+        const retryText = await retry.text();
+        throw new Error(`HubSpot PUT ${url} → ${retry.status}: ${retryText}`);
+      }
+    } else {
+      throw new Error(`HubSpot PUT ${url} → 400: ${text}`);
+    }
+  } else if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`HubSpot PUT ${url} → ${res.status}: ${text}`);
+  }
 }
 
 // ── Create or update company (orchestrator) ───────────────────────────────────

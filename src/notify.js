@@ -57,6 +57,25 @@ export async function notifySupplier(env, { fromName, from, company, productServ
   await sendMessage(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID, text);
 }
 
+// ── Enum auto-correction notification ────────────────────────────────────────
+
+export async function notifyAdminEnum(env, { action, propertyName, rejectedValue, resolvedValue }) {
+  const prop = escHtml(propertyName);
+  const rejected = escHtml(rejectedValue);
+  const resolved = escHtml(resolvedValue || "");
+
+  let text;
+  if (action === "matched") {
+    text = `⚠️ <b>CRM: Auto-corrected category</b>\nProperty: <code>${prop}</code>\nRejected: "${rejected}"\nMatched to: "${resolved}"`;
+  } else if (action === "added") {
+    text = `✅ <b>CRM: New category added to HubSpot</b>\nProperty: <code>${prop}</code>\nAdded: "${rejected}"`;
+  } else {
+    text = `🔴 <b>CRM: Unknown category — action needed</b>\nProperty: <code>${prop}</code>\nValue: "${rejected}"\n<i>Please add this option to HubSpot manually, then use /retry.</i>`;
+  }
+
+  await sendMessage(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID, text);
+}
+
 // ── Pipeline failure notification ─────────────────────────────────────────────
 
 export async function notifyError(env, { from, subject, error, messageId }) {

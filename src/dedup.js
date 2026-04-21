@@ -5,6 +5,7 @@
 //   cache:graph_token           → access token  (55-min TTL)
 //   sub:{email}                 → JSON string   (3-day TTL)  — Graph subscription
 //   failed:{messageId}          → JSON string   (7-day TTL)  — failed pipeline runs
+//   deferred:{messageId}        → JSON string   (30-min TTL) — rate-limited, auto-retry via cron
 //   cache:stages                → JSON array    (1-hour TTL) — HubSpot pipeline stages
 //   tg:pending:{chatId}         → JSON object   (5-min TTL)  — Telegram disambiguation state
 
@@ -14,6 +15,7 @@ const TTL = {
   GRAPH_TOKEN:   60 * 55,             // 55 minutes
   SUBSCRIPTION:  60 * 60 * 24 * 3,   // 3 days
   FAILED:        60 * 60 * 24 * 7,   // 7 days
+  DEFERRED:      60 * 30,             // 30 minutes
   STAGES:        60 * 60,             // 1 hour
   PENDING:       60 * 5,              // 5 minutes
 };
@@ -77,6 +79,26 @@ export async function getFailed(kv, key) {
 }
 
 export async function deleteFailed(kv, key) {
+  await kv.delete(key);
+}
+
+// ── Deferred pipeline runs (rate-limited, auto-retry) ─────────────────────────
+
+export async function saveDeferred(kv, messageId, data) {
+  await kv.put(`deferred:${messageId}`, JSON.stringify(data), { expirationTtl: TTL.DEFERRED });
+}
+
+export async function listDeferred(kv) {
+  const list = await kv.list({ prefix: "deferred:" });
+  return list.keys;
+}
+
+export async function getDeferred(kv, key) {
+  const val = await kv.get(key);
+  return val ? JSON.parse(val) : null;
+}
+
+export async function deleteDeferred(kv, key) {
   await kv.delete(key);
 }
 

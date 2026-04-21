@@ -7,6 +7,13 @@
 const CLAUDE_API = "https://api.anthropic.com/v1/messages";
 const MODEL = "claude-haiku-4-5-20251001";
 
+export class RateLimitError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "RateLimitError";
+  }
+}
+
 // Valid values mirrored from HubSpot custom properties
 const VALID_ENQUIRY_TYPES = ["Fit Out", "Supply & Install", "Project Management", "Carpentry"];
 
@@ -51,6 +58,11 @@ async function claudeCall(apiKey, systemPrompt, userContent, maxTokens) {
       messages: [{ role: "user", content: userContent }],
     }),
   });
+
+  if (res.status === 429) {
+    const body = await res.text();
+    throw new RateLimitError(`Claude API error: ${res.status} ${body}`);
+  }
 
   if (!res.ok) {
     const body = await res.text();

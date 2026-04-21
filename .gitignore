@@ -2,6 +2,10 @@ node_modules/
 .wrangler/
 .dev.vars
 *.env
+.env
 .env.*
 dist/
 .claude/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

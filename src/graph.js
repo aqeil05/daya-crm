@@ -57,9 +57,11 @@ export async function fetchMessage(env, userEmail, messageId) {
 
   const msg = await res.json();
   const rawHtml = msg.body?.content || "";
-  const bodyText = msg.body?.contentType?.toLowerCase() === "text"
-    ? rawHtml
-    : stripHtml(rawHtml);
+  const bodyText = stripQuotedReplies(
+    msg.body?.contentType?.toLowerCase() === "text"
+      ? rawHtml
+      : stripHtml(rawHtml)
+  );
 
   return {
     id: msg.id,
@@ -184,6 +186,25 @@ async function patchSubscription(env, subscriptionId) {
     const body = await res.text();
     throw new Error(`patchSubscription failed: ${res.status} ${body}`);
   }
+}
+
+// ── Strip quoted reply history ────────────────────────────────────────────────
+// Removes old quoted thread content (the main cause of token bloat).
+// Keeps only the newest message — which is where contact details live.
+
+export function stripQuotedReplies(text) {
+  return text
+    // Outlook: "-----Original Message-----" or "-----Forwarded Message-----"
+    .split(/^-{5,}[^-\n]*(?:original|forwarded)[^-\n]*-{5,}/im)[0]
+    // Outlook/Teams horizontal rule (8+ underscores on its own line)
+    .split(/^_{8,}\s*$/m)[0]
+    // Gmail/Apple Mail: "On Mon, Apr 7 2026, John wrote:"
+    .split(/^On .{10,120} wrote:\s*$/m)[0]
+    // Inline Outlook quote header: a line starting with "From:" followed by "Sent:" within 4 lines
+    .replace(/^From:.*\n(?:.*\n){0,3}Sent:.*$/m, "")
+    // RFC 2822 quoted lines — cut at first block of ">"-prefixed lines
+    .split(/^>/m)[0]
+    .trim();
 }
 
 // ── Strip HTML ────────────────────────────────────────────────────────────────
