@@ -16,6 +16,7 @@ import { filterEmail, extractLead, extractSupplier, RateLimitError } from "./cla
 import { upsertContact, createOrUpdateCompany, associateContactCompany, createDeal, createNote } from "./hubspot.js";
 import { appendCrmLog, appendSupplierLog } from "./sheets.js";
 import { notifyLead, notifySupplier, notifyError } from "./notify.js";
+import { claimNotification } from "./gate.js";
 
 const REPLY_BODY = `Thank you for your enquiry. We have received your message and a member of our team will be in touch with you shortly.
 
@@ -114,15 +115,20 @@ export async function pipelineFromMessage(env, msg, inboxEmail, opts = {}) {
       // Auto-reply (dormant — re-enable once pipeline is trusted)
       // await sendReply(env, inboxEmail, from, subject, REPLY_BODY);
 
-      // Telegram
-      await notifyLead(env, {
-        fromName,
-        from,
-        company: lead.company_name || "",
-        sourceInbox: inboxEmail,
-        subject,
-        dealId,
-      });
+      // Telegram — gate prevents duplicate alerts when two concurrent instances
+      // process the same email (e.g. To + CC across separate webhook batches)
+      if (await claimNotification(env, `notif:lead:${conversationId || messageId}`)) {
+        await notifyLead(env, {
+          fromName,
+          from,
+          company: lead.company_name || "",
+          sourceInbox: inboxEmail,
+          subject,
+          dealId,
+        });
+      } else {
+        log("Lead notification already sent by concurrent instance — skipping");
+      }
 
       return { status: "processed", classification: "LEAD", dealId, contactVid };
     }
@@ -182,14 +188,18 @@ export async function pipelineFromMessage(env, msg, inboxEmail, opts = {}) {
         projectDescription: supplier.product_service || "",
       });
 
-      // Telegram
-      await notifySupplier(env, {
-        fromName,
-        from,
-        company: supplier.company_name || "",
-        productService: supplier.product_service || "",
-        sourceInbox: inboxEmail,
-      });
+      // Telegram — gate prevents duplicate alerts (same race window as LEAD path)
+      if (await claimNotification(env, `notif:supplier:${conversationId || messageId}`)) {
+        await notifySupplier(env, {
+          fromName,
+          from,
+          company: supplier.company_name || "",
+          productService: supplier.product_service || "",
+          sourceInbox: inboxEmail,
+        });
+      } else {
+        log("Supplier notification already sent by concurrent instance — skipping");
+      }
 
       return { status: "processed", classification: "SUPPLIER", contactVid };
     }

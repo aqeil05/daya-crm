@@ -20,6 +20,98 @@ const MODEL = "claude-haiku-4-5-20251001";
 //   { action: "report",         from, to      }  — ISO date strings
 //   { action: "unknown"                        }
 
+// ── resolveReportStages ───────────────────────────────────────────────────────
+// Maps pipeline stages to won/lost/presented semantics.
+// First tries fast substring matching; falls back to Haiku if labels are unusual.
+
+export async function resolveReportStages(env, stages) {
+  const tryFind = (...keywords) =>
+    keywords.reduce((found, kw) => found || stages.find((s) => s.label.toLowerCase().includes(kw)), null);
+
+  const wonStage       = tryFind("closed won", "won");
+  const lostStage      = tryFind("closed lost", "lost");
+  const presentedStage = tryFind("presented", "pitch", "proposal");
+
+  if (wonStage && lostStage) {
+    return { wonStage, lostStage, presentedStage };
+  }
+
+  // Haiku fallback: ask the model to identify stages from actual labels
+  const labels = stages.map((s) => `${s.id}: ${s.label}`).join("\n");
+
+  const res = await fetch(`${ANTHROPIC_BASE}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 120,
+      system: `You are mapping CRM pipeline stages. Given a list of stage IDs and labels, return JSON identifying which stage represents each outcome.
+Return ONLY: {"won":"<id>","lost":"<id>","presented":"<id or null>"}
+Use null if no stage clearly matches. No markdown, no explanation.`,
+      messages: [{ role: "user", content: labels }],
+    }),
+  });
+
+  if (res.ok) {
+    const data = await res.json();
+    let raw = data.content?.[0]?.text?.trim() || "";
+    raw = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+    try {
+      const mapping = JSON.parse(raw);
+      return {
+        wonStage:       stages.find((s) => s.id === mapping.won)       || wonStage,
+        lostStage:      stages.find((s) => s.id === mapping.lost)      || lostStage,
+        presentedStage: stages.find((s) => s.id === mapping.presented) || presentedStage,
+      };
+    } catch {
+      console.error("resolveReportStages: failed to parse Haiku response:", raw);
+    }
+  }
+
+  return { wonStage, lostStage, presentedStage };
+}
+
+// ── formatReportWithClaude ────────────────────────────────────────────────────
+// Passes raw report metrics to Haiku to produce a nicely formatted Telegram
+// HTML message. Falls back to a plain-text summary if the API call fails.
+
+export async function formatReportWithClaude(env, reportData) {
+  const res = await fetch(`${ANTHROPIC_BASE}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 700,
+      system: `You are a CRM assistant formatting a sales pipeline report for Telegram.
+
+Rules:
+- Use Telegram HTML only: <b>, <i>, <a>. No other tags. No markdown.
+- Be concise and scannable. Use emojis meaningfully.
+- Structure: period header → pipeline snapshot (open deals by stage) → closed period stats → conversion if available → avg close time if available.
+- For win rate and conversion, show percentage with emoji indicator (✅ if >= 50%, ⚠️ if < 50%).
+- If a metric is null, omit that line rather than showing "—".
+- Return ONLY the formatted HTML string. No explanation, no code fences.`,
+      messages: [{ role: "user", content: JSON.stringify(reportData) }],
+    }),
+  });
+
+  if (!res.ok) {
+    console.error(`formatReportWithClaude: API error ${res.status}`);
+    return null;
+  }
+
+  const data = await res.json();
+  return data.content?.[0]?.text?.trim() || null;
+}
+
 export async function parseBotIntent(env, userText, stageNames, today) {
   const stageList = stageNames.join(", ");
 

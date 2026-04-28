@@ -6,6 +6,9 @@
     "deploy": "wrangler deploy",
     "tail": "wrangler tail"
   },
+  "dependencies": {
+    "@cloudflare/puppeteer": "*"
+  },
   "devDependencies": {
     "wrangler": "^3.0.0"
   }

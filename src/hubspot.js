@@ -107,6 +107,35 @@ export async function searchCompany(env, companyName) {
   return null;
 }
 
+// ── Company domain search ─────────────────────────────────────────────────────
+// Secondary dedup: if name search misses a variant (e.g. "ABC Ltd" vs "ABC Trading"),
+// check whether a company with the same email domain already exists.
+// Skips generic free-email domains where domain has no dedup value.
+
+const GENERIC_DOMAINS = new Set([
+  "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
+  "icloud.com", "live.com", "me.com", "msn.com",
+]);
+
+export async function searchCompanyByDomain(env, domain) {
+  if (!domain || GENERIC_DOMAINS.has(domain.toLowerCase())) return null;
+
+  const token = env.HUBSPOT_PRIVATE_APP_TOKEN;
+  const data = await hsRequest("POST", `${HS_BASE}/crm/v3/objects/companies/search`, token, {
+    filterGroups: [{
+      filters: [{
+        propertyName: "domain",
+        operator: "EQ",
+        value: domain.toLowerCase(),
+      }],
+    }],
+    properties: ["name", "domain"],
+    limit: 1,
+  });
+
+  return data?.total > 0 ? data.results[0].id : null;
+}
+
 // ── Enum validation helpers ───────────────────────────────────────────────────
 
 // Fetch live picklist options for a company property.
@@ -312,9 +341,17 @@ export async function updateCompany(env, companyId, { domain, mainIndustry, subI
 // Returns company ID
 
 export async function createOrUpdateCompany(env, { companyName, email, mainIndustry, subIndustries, relationship }) {
-  const domain = email?.split("@")[1] || "";
+  const domain = email?.split("@")[1]?.toLowerCase() || "";
 
-  const existingId = await searchCompany(env, companyName);
+  // Primary: search by company name (fuzzy, normalised)
+  let existingId = await searchCompany(env, companyName);
+
+  // Fallback: search by email domain — catches name variants of the same company
+  // (e.g. "ABC Trading L.L.C." vs "ABC Trading" already in HubSpot)
+  if (!existingId && domain) {
+    existingId = await searchCompanyByDomain(env, domain);
+  }
+
   if (existingId) {
     await updateCompany(env, existingId, { domain, mainIndustry, subIndustries, relationship });
     return existingId;

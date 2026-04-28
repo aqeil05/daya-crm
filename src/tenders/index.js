@@ -5,22 +5,33 @@
 
 import { matchesKeywords } from "./keywords.js";
 import { extractTenders } from "./extract.js";
-import { notifyTender } from "./notify.js";
+import { notifyTender, notifyTenderScanSummary } from "./notify.js";
 import { fetchTenders as fetchMonaqasat, PORTAL_ID as MONAQASAT_ID } from "./portals/monaqasat.js";
 import { fetchTenders as fetchBidDetail, PORTAL_ID as BIDDETAIL_ID } from "./portals/biddetail.js";
+import { fetchTenders as fetchTenderDetail, PORTAL_ID as TENDERDETAIL_ID } from "./portals/tenderdetail.js";
+import { fetchTenders as fetchQatarFoundation, PORTAL_ID as QF_ID } from "./portals/qatar-foundation.js";
+import { claimNotification } from "../gate.js";
 // Ashghal retired: migrated to Monaqasat (Qatar unified procurement).
 // biddetail-p2 retired: BidDetail pagination is JS-driven; page 2 returns same data as page 1.
 
-// Add new portals here as objects with { id, fetch }
-const PORTALS = [
-  { id: MONAQASAT_ID, fetch: fetchMonaqasat },
-  { id: BIDDETAIL_ID, fetch: fetchBidDetail },
-];
+// ── Portal registry ───────────────────────────────────────────────────────────
+// QF needs env for session-cookie secrets, so its fetch is a closure.
+// Add new portals here as objects with { id, fetch }.
+
+function buildPortals(env) {
+  return [
+    { id: MONAQASAT_ID,    fetch: fetchMonaqasat },
+    { id: BIDDETAIL_ID,    fetch: fetchBidDetail },
+    { id: TENDERDETAIL_ID, fetch: fetchTenderDetail },
+    { id: QF_ID,           fetch: () => fetchQatarFoundation(env) },
+  ];
+}
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
 export async function runTenderScan(env) {
   const results = [];
+  const PORTALS = buildPortals(env);
 
   for (const portal of PORTALS) {
     try {
@@ -62,8 +73,13 @@ export async function runTenderScan(env) {
         if (!matchesKeywords(tender.title, tender.description)) continue;
 
         try {
-          await notifyTender(env, portal.id, tender);
-          alertCount++;
+          // Gate prevents duplicate alerts if two cron instances overlap
+          if (await claimNotification(env, `notif:tender:${portal.id}:${tenderId}`)) {
+            await notifyTender(env, portal.id, tender);
+            alertCount++;
+          } else {
+            console.log(`[tenders] ${portal.id}: tender ${tenderId} already alerted by concurrent instance`);
+          }
         } catch (err) {
           console.error(`[tenders] ${portal.id}: Telegram notify failed — ${err.message}`);
         }
@@ -79,6 +95,12 @@ export async function runTenderScan(env) {
       console.error(`[tenders] ${portal.id} failed: ${err.message}`);
       results.push({ portal: portal.id, status: "error", error: err.message });
     }
+  }
+
+  try {
+    await notifyTenderScanSummary(env, results);
+  } catch (err) {
+    console.error(`[tenders] Failed to send scan summary: ${err.message}`);
   }
 
   return results;

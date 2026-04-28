@@ -28,7 +28,8 @@ Rules:
 - Do NOT invent or guess data — use empty string for any missing field
 - For portals "biddetail" and "monaqasat": all tenders are Qatar-based — always set country to "Qatar" unless a different country is explicitly stated in the tender text
 - For portal "biddetail": if id is a numeric string and url is empty, set url to "https://www.biddetail.com/latest-tenders/{id}" (substitute the actual id)
-- Return ONLY the JSON array with no markdown fences, no explanation, no preamble`;
+- Return ONLY the JSON array with no markdown fences, no explanation, no preamble
+- For portal "qatar-foundation": input is Oracle Fusion JSON. Map fields: NegotiationNumber→id, NegotiationTitle→title, NegotiationDescription→description, CloseDate→deadline (YYYY-MM-DD), BusinessUnitName→issuer. Set country to "Qatar"`;
 
 export async function extractTenders(env, portalId, rawText) {
   if (!rawText || rawText.trim().length < 50) {
@@ -36,7 +37,9 @@ export async function extractTenders(env, portalId, rawText) {
     return [];
   }
 
-  const userContent = `Portal: ${portalId}\n\nScraped page text:\n${rawText.slice(0, 6000)}`;
+  // Puppeteer-based portals have long pages — use a larger slice
+  const charLimit = portalId === "qatar-foundation" ? 12000 : 6000;
+  const userContent = `Portal: ${portalId}\n\nScraped page text:\n${rawText.slice(0, charLimit)}`;
 
   const res = await fetch(CLAUDE_API, {
     method: "POST",
@@ -47,7 +50,7 @@ export async function extractTenders(env, portalId, rawText) {
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 1500,
+      max_tokens: 3000,
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content: userContent }],
     }),

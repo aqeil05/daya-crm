@@ -7,7 +7,7 @@
 //   GET  /setup-telegram  — one-time: register Telegram webhook
 
 import { sendMessage, escHtml } from "./notify.js";
-import { parseBotIntent } from "./telegram-claude.js";
+import { parseBotIntent, resolveReportStages, formatReportWithClaude } from "./telegram-claude.js";
 import {
   getPipelineStages,
   findDealsByCompanyName,
@@ -264,33 +264,40 @@ async function sendReport(env, chatId, fromDate, toDate, stages) {
   const fromIso = `${fromDate}T00:00:00.000Z`;
   const toIso   = `${toDate}T23:59:59.999Z`;
 
-  // Resolve stage IDs for filtering
-  const wonStage  = stages.find((s) => s.label.toLowerCase().includes("closed won"));
-  const lostStage = stages.find((s) => s.label.toLowerCase().includes("closed lost"));
-  const presentedStage = stages.find((s) => s.label.toLowerCase().includes("presented"));
+  // Resolve won/lost/presented stage IDs — uses Haiku fallback for unusual labels
+  const { wonStage, lostStage, presentedStage } = await resolveReportStages(env, stages);
 
-  // Run queries in parallel
-  const [openDeals, closedDeals, presentedConversions] = await Promise.all([
+  // Run core HubSpot queries in parallel
+  const [openDeals, closedDeals] = await Promise.all([
     listOpenDeals(env),
     getClosedDealsInPeriod(env, fromIso, toIso),
-    presentedStage
-      ? getPresentedConversions(env, presentedStage.id, fromIso, toIso)
-      : Promise.resolve([]),
   ]);
 
-  // Pipeline snapshot — group open deals by stage
+  // Presented conversions query is optional — HubSpot returns 400 if the
+  // hs_date_entered_{stageId} property doesn't exist yet (no deals ever entered
+  // that stage). Failing here must not take down the whole report.
+  let presentedConversions = [];
+  if (presentedStage) {
+    try {
+      presentedConversions = await getPresentedConversions(env, presentedStage.id, fromIso, toIso);
+    } catch (err) {
+      console.warn(`[report] getPresentedConversions failed — skipping: ${err.message}`);
+    }
+  }
+
+  // Pipeline snapshot — count open deals per stage
   const openByStage = {};
   for (const deal of openDeals) {
     openByStage[deal.dealstage] = (openByStage[deal.dealstage] || 0) + 1;
   }
 
-  // Closed stats
-  const wonCount  = closedDeals.filter((d) => d.dealstage === wonStage?.id).length;
-  const lostCount = closedDeals.filter((d) => d.dealstage === lostStage?.id).length;
+  // Closed stats for the period
+  const wonCount    = closedDeals.filter((d) => d.dealstage === wonStage?.id).length;
+  const lostCount   = closedDeals.filter((d) => d.dealstage === lostStage?.id).length;
   const totalClosed = wonCount + lostCount;
-  const winRate = totalClosed > 0 ? Math.round((wonCount / totalClosed) * 100) : null;
+  const winRate     = totalClosed > 0 ? Math.round((wonCount / totalClosed) * 100) : null;
 
-  // Presented → outcome
+  // Presented → outcome conversion
   const presWon  = presentedConversions.filter((d) => d.dealstage === wonStage?.id).length;
   const presLost = presentedConversions.filter((d) => d.dealstage === lostStage?.id).length;
   const presTotal = presWon + presLost;
@@ -300,55 +307,47 @@ async function sendReport(env, chatId, fromDate, toDate, stages) {
   const closedWithDates = closedDeals.filter((d) => d.createdate && d.closedate);
   let avgCloseDays = null;
   if (closedWithDates.length > 0) {
-    const totalMs = closedWithDates.reduce((sum, d) => {
-      return sum + (new Date(d.closedate) - new Date(d.createdate));
-    }, 0);
+    const totalMs = closedWithDates.reduce(
+      (sum, d) => sum + (new Date(d.closedate) - new Date(d.createdate)),
+      0,
+    );
     avgCloseDays = Math.round(totalMs / closedWithDates.length / (1000 * 60 * 60 * 24));
   }
 
-  // Format dates for header
   const fromLabel = formatDate(fromDate);
   const toLabel   = formatDate(toDate);
 
-  // Build message
-  const lines = [
-    `📊 <b>Report: ${fromLabel} – ${toLabel}</b>`,
-    "",
-    "<b>Pipeline (current)</b>",
-    ...stages
-      .filter((s) => !s.label.toLowerCase().includes("closed"))
-      .map((s) => {
-        const count = openByStage[s.id] || 0;
-        return `• ${escHtml(s.label)}: ${count}`;
-      }),
-    `• <b>Total open: ${openDeals.length}</b>`,
-    "",
-    "<b>Closed this period</b>",
-    `• Won:  ${wonCount} ✅`,
-    `• Lost: ${lostCount} ❌`,
-    winRate !== null
-      ? `• Win rate: ${winRate}%`
-      : "• Win rate: — (no closed deals)",
-    "",
-  ];
+  // Pass all metrics to Haiku for nice formatting
+  const reportData = {
+    period: { from: fromLabel, to: toLabel },
+    pipeline: {
+      stages: stages
+        .filter((s) => s.id !== wonStage?.id && s.id !== lostStage?.id)
+        .map((s) => ({ label: s.label, count: openByStage[s.id] || 0 })),
+      totalOpen: openDeals.length,
+    },
+    closed: { won: wonCount, lost: lostCount, winRate },
+    presented: presentedStage
+      ? { won: presWon, lost: presLost, conversionRate: presConversion }
+      : null,
+    avgCloseDays,
+  };
 
-  if (presentedStage) {
-    lines.push(
-      `<b>Presented → Outcome</b>`,
-      `• → Closed Won:  ${presWon}`,
-      `• → Closed Lost: ${presLost}`,
-      presConversion !== null
-        ? `• Conversion: ${presConversion}%`
-        : "• Conversion: — (no data)",
-      "",
-    );
+  const formatted = await formatReportWithClaude(env, reportData);
+
+  // Fall back to a plain summary if Haiku fails
+  if (!formatted) {
+    const fallback = [
+      `📊 <b>Report: ${escHtml(fromLabel)} – ${escHtml(toLabel)}</b>`,
+      `Open deals: ${openDeals.length}`,
+      `Won: ${wonCount}  Lost: ${lostCount}`,
+      winRate !== null ? `Win rate: ${winRate}%` : null,
+      avgCloseDays !== null ? `Avg close: ${avgCloseDays} days` : null,
+    ].filter(Boolean).join("\n");
+    return reply(env, chatId, fallback);
   }
 
-  if (avgCloseDays !== null) {
-    lines.push(`⏱ Avg. time to close: ${avgCloseDays} days`);
-  }
-
-  return reply(env, chatId, lines.join("\n"));
+  return reply(env, chatId, formatted);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

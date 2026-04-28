@@ -14,6 +14,8 @@
 // Scheduled (cron 0 */6  * * *): Scan tender portals every 6 hours
 // Scheduled (* * * * *)        : Auto-retry rate-limited (deferred) messages every minute
 
+export { NotificationGate } from "./notification-gate.js";
+
 import { pipeline, pipelineFromMessage } from "./pipeline.js";
 import { registerSubscription, renewSubscriptions, stripQuotedReplies, INBOXES } from "./graph.js";
 import { getSubscription, listFailed, getFailed, deleteFailed, listDeferred, getDeferred, deleteDeferred } from "./dedup.js";
@@ -75,6 +77,16 @@ export default {
     // ── One-time Telegram webhook registration ────────────────────────────────
     if (url.pathname === "/setup-telegram" && request.method === "GET") {
       return handleSetupTelegram(env);
+    }
+
+    // ── QF portal setup: step 1 — submit credentials, triggers OTP SMS ──────
+    if (url.pathname === "/qf/start-setup" && request.method === "GET") {
+      return handleQfStartSetup(request, env, ctx);
+    }
+
+    // ── QF portal setup: step 2 — submit OTP code ────────────────────────────
+    if (url.pathname === "/qf/complete-setup" && request.method === "GET") {
+      return handleQfCompleteSetup(request, env);
     }
 
     // ── Manual tender scan trigger (dev / ops) ────────────────────────────────
@@ -399,8 +411,10 @@ async function handleTendersDebug(env, url) {
   const portalId = url.searchParams.get("portal");
 
   const FETCHERS = {
-    monaqasat: () => import("./tenders/portals/monaqasat.js").then(m => m.fetchTenders()),
-    biddetail:  () => import("./tenders/portals/biddetail.js").then(m => m.fetchTenders()),
+    monaqasat:         () => import("./tenders/portals/monaqasat.js").then(m => m.fetchTenders()),
+    biddetail:         () => import("./tenders/portals/biddetail.js").then(m => m.fetchTenders()),
+    tenderdetail:      () => import("./tenders/portals/tenderdetail.js").then(m => m.fetchTenders()),
+    "qatar-foundation": () => import("./tenders/portals/qatar-foundation.js").then(m => m.fetchTenders(env)),
   };
 
   if (!portalId || !FETCHERS[portalId]) {
@@ -475,6 +489,63 @@ async function handleSetup(env) {
     status: allOk ? 200 : 207,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+// ── /qf/start-setup ───────────────────────────────────────────────────────────
+// Step 1 of QF portal setup. Launches Puppeteer in the background, submits
+// credentials, and waits up to 5 minutes for the user to provide the OTP via
+// /qf/complete-setup. Responds immediately so the browser doesn't time out.
+
+async function handleQfStartSetup(request, env, ctx) {
+  const { startLoginFlow } = await import("./tenders/portals/qatar-foundation.js");
+
+  // Clear any stale pending OTP from a previous attempt
+  await env.DAYA_KV.delete("qf:pending_otp");
+
+  // Run Puppeteer login in the background — keeps running after HTTP response
+  ctx.waitUntil(
+    startLoginFlow(env)
+      .then(result => console.log(`[qf-setup] Complete — saved ${result.cookieCount} cookies`))
+      .catch(err  => console.error(`[qf-setup] Failed: ${err.message}`))
+  );
+
+  const workerUrl = env.WORKER_URL || "https://daya-crm-worker.daya-timesheet.workers.dev";
+  return new Response(
+    [
+      "QF login submitted — Puppeteer is logging in now.",
+      "Check your phone for the OTP SMS (arrives in ~10 seconds).",
+      "",
+      "Once you have it, open this URL (replace XXXXXX with your code):",
+      `${workerUrl}/qf/complete-setup?otp=XXXXXX`,
+      "",
+      "You have 5 minutes.",
+    ].join("\n"),
+    { status: 200, headers: { "Content-Type": "text/plain" } }
+  );
+}
+
+// ── /qf/complete-setup ────────────────────────────────────────────────────────
+// Step 2 of QF portal setup. Stores the OTP in KV so the background Puppeteer
+// session (started by /qf/start-setup) can pick it up and complete the login.
+
+async function handleQfCompleteSetup(request, env) {
+  const otp = new URL(request.url).searchParams.get("otp");
+  if (!otp) {
+    return new Response("Missing ?otp= parameter. Usage: /qf/complete-setup?otp=123456", { status: 400 });
+  }
+
+  await env.DAYA_KV.put("qf:pending_otp", otp, { expirationTtl: 600 }); // 10-min TTL
+
+  return new Response(
+    [
+      "OTP received ✓",
+      "The background Puppeteer session is completing login — cookies will be saved within ~30 seconds.",
+      "",
+      "Then verify with:",
+      "GET /tenders/debug?portal=qatar-foundation",
+    ].join("\n"),
+    { status: 200, headers: { "Content-Type": "text/plain" } }
+  );
 }
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
